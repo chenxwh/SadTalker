@@ -1,45 +1,47 @@
 """run bash scripts/download_models.sh first to prepare the weights file"""
+
 import os
 import shutil
-from argparse import Namespace
+import subprocess
+import time
+import torch
+from cog import BasePredictor, Input, Path
+from pydub import AudioSegment
+
 from src.utils.preprocess import CropAndExtract
 from src.test_audio2coeff import Audio2Coeff
 from src.facerender.animate import AnimateFromCoeff
 from src.generate_batch import get_data
 from src.generate_facerender_batch import get_facerender_data
 from src.utils.init_path import init_path
-from cog import BasePredictor, Input, Path
 
-checkpoints = "checkpoints"
+
+# prepare weights from https://huggingface.co/spaces/vinthony/SadTalker/tree/main/checkpoints, then push and load from replicate.delivery for faster inference
+MODEL_URL = (
+    "https://weights.replicate.delivery/default/vinthony/SadTalker/checkpoints.tar"
+)
+GFPGA_URL = "https://weights.replicate.delivery/default/vinthony/SadTalker/gfpgan.tar"
+MODEL_CACHE = "checkpoints"
+GFPGAN_CACHE = "gfpgan"
+
+
+def download_weights(url, dest):
+    start = time.time()
+    print("downloading url: ", url)
+    print("downloading to: ", dest)
+    subprocess.check_call(["pget", "-x", url, dest], close_fds=False)
+    print("downloading took: ", time.time() - start)
 
 
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        device = "cuda"
 
-        
-        sadtalker_paths = init_path(checkpoints,os.path.join("src","config"))
-
-        # init model
-        self.preprocess_model = CropAndExtract(sadtalker_paths, device
-        )
-
-        self.audio_to_coeff = Audio2Coeff(
-            sadtalker_paths,
-            device,
-        )
-
-        self.animate_from_coeff = {
-            "full": AnimateFromCoeff(
-                sadtalker_paths,
-                device,
-            ),
-            "others": AnimateFromCoeff(
-                sadtalker_paths,
-                device,
-            ),
-        }
+        if not os.path.exists(MODEL_CACHE):
+            download_weights(MODEL_URL, MODEL_CACHE)
+        if not os.path.exists(GFPGAN_CACHE):
+            download_weights(GFPGA_URL, GFPGAN_CACHE)
+        self.sad_talker = SadTalker(checkpoint_path=MODEL_CACHE)
 
     def predict(
         self,
@@ -49,144 +51,176 @@ class Predictor(BasePredictor):
         driven_audio: Path = Input(
             description="Upload the driven audio, accepts .wav and .mp4 file",
         ),
-        enhancer: str = Input(
-            description="Choose a face enhancer",
-            choices=["gfpgan", "RestoreFormer"],
-            default="gfpgan",
+        use_enhancer: bool = Input(
+            description="Use GFPGAN as Face enhancer",
+            default=False,
+        ),
+        pose_style: int = Input(description="Pose style", le=45, ge=0, default=0),
+        expression_scale: float = Input(
+            description=" a larger value will make the expression motion stronger",
+            default=1.0,
+        ),
+        use_eyeblink: bool = Input(
+            description="Use eye blink",
+            default=True,
         ),
         preprocess: str = Input(
-            description="how to preprocess the images",
-            choices=["crop", "resize", "full"],
-            default="full",
+            description="Choose how to preprocess the images",
+            choices=["crop", "resize", "full", "extcrop", "extfull"],
+            default="crop",
         ),
-        ref_eyeblink: Path = Input(
-            description="path to reference video providing eye blinking",
-            default=None,
+        size_of_image: int = Input(
+            description="Face model resolution", choices=[256, 512], default=256
         ),
-        ref_pose: Path = Input(
-            description="path to reference video providing pose",
-            default=None,
+        facerender: str = Input(
+            description="Choose face render",
+            choices=["facevid2vid", "pirender"],
+            default="facevid2vid",
         ),
-        still: bool = Input(
-            description="can crop back to the original videos for the full body aniamtion when preprocess is full",
+        still_mode: bool = Input(
+            description="Still Mode (fewer head motion, works with preprocess 'full')",
             default=True,
         ),
     ) -> Path:
         """Run a single prediction on the model"""
 
-        animate_from_coeff = (
-            self.animate_from_coeff["full"]
-            if preprocess == "full"
-            else self.animate_from_coeff["others"]
+        exp_dir = "exp_dir"
+        if os.path.exists(exp_dir):
+            shutil.rmtree(exp_dir)
+        os.makedirs(exp_dir)
+
+        mp4_path = self.sad_talker.test(
+            source_image=str(source_image),
+            driven_audio=str(driven_audio),
+            preprocess=preprocess,
+            still_mode=still_mode,
+            use_enhancer=use_enhancer,
+            batch_size=1,
+            size=size_of_image,
+            pose_style=pose_style,
+            exp_scale=expression_scale,
+            use_ref_video=False,
+            ref_video=None,
+            ref_info=None,
+            length_of_audio=0,
+            use_blink=use_eyeblink,
+            save_dir=exp_dir,
         )
 
-        args = load_default()
-        args.pic_path = str(source_image)
-        args.audio_path = str(driven_audio)
-        device = "cuda"
-        args.still = still
-        args.ref_eyeblink = None if ref_eyeblink is None else str(ref_eyeblink)
-        args.ref_pose = None if ref_pose is None else str(ref_pose)
+        output = "/tmp/out.mp4"
+        shutil.copy(mp4_path, output)
+        return Path(output)
+
+
+def mp3_to_wav(mp3_filename, wav_filename, frame_rate):
+    mp3_file = AudioSegment.from_file(file=mp3_filename)
+    mp3_file.set_frame_rate(frame_rate).export(wav_filename, format="wav")
+
+
+class SadTalker:
+
+    def __init__(self, checkpoint_path="checkpoints", config_path="src/config"):
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        os.environ["TORCH_HOME"] = checkpoint_path
+        self.checkpoint_path = checkpoint_path
+        self.config_path = config_path
+
+    def test(
+        self,
+        source_image,
+        driven_audio,
+        preprocess="crop",
+        still_mode=False,
+        use_enhancer=False,
+        batch_size=1,
+        size=256,
+        pose_style=0,
+        exp_scale=1.0,
+        use_ref_video=False,
+        ref_video=None,
+        ref_info=None,
+        length_of_audio=0,
+        use_blink=True,
+        save_dir="./exp_dir/",
+    ):
+
+        self.sadtalker_paths = init_path(
+            self.checkpoint_path, self.config_path, size, False, preprocess
+        )
+
+        self.audio_to_coeff = Audio2Coeff(self.sadtalker_paths, self.device)
+        self.preprocess_model = CropAndExtract(self.sadtalker_paths, self.device)
+        self.animate_from_coeff = AnimateFromCoeff(self.sadtalker_paths, self.device)
+
+        if ".mp3" in driven_audio:
+            audio_path = "input.wav"
+            mp3_to_wav(driven_audio, audio_path, 16000)
+        else:
+            audio_path = driven_audio
 
         # crop image and extract 3dmm from image
-        results_dir = "results"
-        if os.path.exists(results_dir):
-            shutil.rmtree(results_dir)
-        os.makedirs(results_dir)
-        first_frame_dir = os.path.join(results_dir, "first_frame_dir")
-        os.makedirs(first_frame_dir)
-
-        print("3DMM Extraction for source image")
+        first_frame_dir = os.path.join(save_dir, "first_frame_dir")
+        os.makedirs(first_frame_dir, exist_ok=True)
         first_coeff_path, crop_pic_path, crop_info = self.preprocess_model.generate(
-            args.pic_path, first_frame_dir, preprocess, source_image_flag=True
+            source_image, first_frame_dir, preprocess, True, size
         )
+
         if first_coeff_path is None:
-            print("Can't get the coeffs of the input")
-            return
+            raise AttributeError("No face is detected")
 
-        if ref_eyeblink is not None:
-            ref_eyeblink_videoname = os.path.splitext(os.path.split(ref_eyeblink)[-1])[
-                0
-            ]
-            ref_eyeblink_frame_dir = os.path.join(results_dir, ref_eyeblink_videoname)
-            os.makedirs(ref_eyeblink_frame_dir, exist_ok=True)
-            print("3DMM Extraction for the reference video providing eye blinking")
-            ref_eyeblink_coeff_path, _, _ = self.preprocess_model.generate(
-                ref_eyeblink, ref_eyeblink_frame_dir
-            )
-        else:
-            ref_eyeblink_coeff_path = None
+        ref_video_coeff_path = None
+        ref_pose_coeff_path = None
+        ref_eyeblink_coeff_path = None
 
-        if ref_pose is not None:
-            if ref_pose == ref_eyeblink:
-                ref_pose_coeff_path = ref_eyeblink_coeff_path
-            else:
-                ref_pose_videoname = os.path.splitext(os.path.split(ref_pose)[-1])[0]
-                ref_pose_frame_dir = os.path.join(results_dir, ref_pose_videoname)
-                os.makedirs(ref_pose_frame_dir, exist_ok=True)
-                print("3DMM Extraction for the reference video providing pose")
-                ref_pose_coeff_path, _, _ = self.preprocess_model.generate(
-                    ref_pose, ref_pose_frame_dir
-                )
-        else:
-            ref_pose_coeff_path = None
-
-        # audio2ceoff
         batch = get_data(
             first_coeff_path,
-            args.audio_path,
-            device,
-            ref_eyeblink_coeff_path,
-            still=still,
-        )
+            audio_path,
+            self.device,
+            ref_eyeblink_coeff_path=ref_eyeblink_coeff_path,
+            still=still_mode,
+            idlemode=False,
+            length_of_audio=length_of_audio,
+            use_blink=use_blink,
+        )  # longer audio?
         coeff_path = self.audio_to_coeff.generate(
-            batch, results_dir, args.pose_style, ref_pose_coeff_path
+            batch, save_dir, pose_style, ref_pose_coeff_path
         )
+
         # coeff2video
-        print("coeff2video")
         data = get_facerender_data(
             coeff_path,
             crop_pic_path,
             first_coeff_path,
-            args.audio_path,
-            args.batch_size,
-            args.input_yaw,
-            args.input_pitch,
-            args.input_roll,
-            expression_scale=args.expression_scale,
-            still_mode=still,
+            audio_path,
+            batch_size,
+            still_mode=still_mode,
             preprocess=preprocess,
+            size=size,
+            expression_scale=exp_scale,
         )
-        animate_from_coeff.generate(
-            data, results_dir, args.pic_path, crop_info,
-            enhancer=enhancer, background_enhancer=args.background_enhancer,
-            preprocess=preprocess)
+        return_path = self.animate_from_coeff.generate(
+            data,
+            save_dir,
+            source_image,
+            crop_info,
+            enhancer="gfpgan" if use_enhancer else None,
+            preprocess=preprocess,
+            img_size=size,
+        )
+        video_name = data["video_name"]
+        print(f"The generated video is named {video_name} in {save_dir}")
 
-        output = "/tmp/out.mp4"
-        mp4_path = os.path.join(results_dir, [f for f in os.listdir(results_dir) if "enhanced.mp4" in f][0])
-        shutil.copy(mp4_path, output)
+        del self.preprocess_model
+        del self.audio_to_coeff
+        del self.animate_from_coeff
 
-        return Path(output)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
+        import gc
 
-def load_default():
-    return Namespace(
-        pose_style=0,
-        batch_size=2,
-        expression_scale=1.0,
-        input_yaw=None,
-        input_pitch=None,
-        input_roll=None,
-        background_enhancer=None,
-        face3dvis=False,
-        net_recon="resnet50",
-        init_path=None,
-        use_last_fc=False,
-        bfm_folder="./src/config/",
-        bfm_model="BFM_model_front.mat",
-        focal=1015.0,
-        center=112.0,
-        camera_d=10.0,
-        z_near=5.0,
-        z_far=15.0,
-    )
+        gc.collect()
+
+        return return_path
